@@ -48,14 +48,19 @@ window.Views.compare = (function () {
         if (!imgId || !resultId) { C.toast("请选择原图与结果", "error"); return; }
         const box = el.querySelector("#cp-diff-stage");
         box.innerHTML = `<div class="loading">计算差异…</div>`;
-        const r = await Api.post("/api/compare/diff", { image_id: imgId, result_id: resultId });
-        box.innerHTML = `<img src="${r.file_url}?t=${Date.now()}">`;
-        const m = r.metrics;
-        el.querySelector("#cp-metrics").innerHTML = `
-          <div>MSE：<strong>${m.mse}</strong></div>
-          <div>RMSE：<strong>${m.rmse}</strong></div>
-          <div>PSNR：<strong>${m.psnr} dB</strong></div>
-          <div>变化像素占比：<strong>${(m.changed_ratio * 100).toFixed(2)}%</strong></div>`;
+        try {
+          const r = await Api.post("/api/compare/diff", { image_id: imgId, result_id: resultId });
+          box.innerHTML = `<img src="${r.file_url}?t=${Date.now()}">`;
+          const m = r.metrics;
+          el.querySelector("#cp-metrics").innerHTML = `
+            <div>MSE：<strong>${m.mse}</strong></div>
+            <div>RMSE：<strong>${m.rmse}</strong></div>
+            <div>PSNR：<strong>${m.psnr} dB</strong></div>
+            <div>变化像素占比：<strong>${(m.changed_ratio * 100).toFixed(2)}%</strong></div>`;
+        } catch (e) {
+          box.innerHTML = `<div class="dim">差异分析失败：${C.esc(e.message)}</div>`;
+          C.toast(e.message, "error");
+        }
       };
 
       bindSlider(el);
@@ -66,8 +71,10 @@ window.Views.compare = (function () {
 
   async function loadResults(el) {
     const r = await Api.get("/api/results");
+    // 只列真正的处理结果；差异热力图等可视化副产物即使后端漏过滤也不展示
+    const results = r.results.filter((x) => (x.kind || "result") === "result");
     el.querySelector("#cp-result").innerHTML = `<option value="">— 选择结果 —</option>` +
-      r.results.map((x) => `<option value="${x.result_id}">${C.fmtDate(x.created_at)} · ${x.width}×${x.height}</option>`).join("");
+      results.map((x) => `<option value="${x.result_id}">${C.fmtDate(x.created_at)} · ${x.width}×${x.height}</option>`).join("");
   }
 
   async function updateCompare(el) {

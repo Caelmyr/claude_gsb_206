@@ -12,7 +12,7 @@ from PIL import Image, ImageChops
 from . import config, pipeline as pipeline_engine
 from .algorithms import detection, features, segmentation, style, util
 from .batch import BatchManager, process_image
-from .cache import ResultCache, make_key
+from .cache import ResultCache, make_key, KIND_RESULT, KIND_DIFF
 from .history import HistoryManager
 from .image_store import ImageStore
 from .nodes import CATEGORIES, get_public_nodes
@@ -83,6 +83,7 @@ def _result_view(entry):
     return {
         "result_id": entry.get("result_id"),
         "key": entry.get("key"),
+        "kind": entry.get("kind", KIND_RESULT),
         "width": entry.get("width"),
         "height": entry.get("height"),
         "size_bytes": entry.get("size_bytes"),
@@ -455,6 +456,9 @@ def compare_diff():
     data = request.get_json(silent=True) or {}
     rec, img_a = _load_full_image(data.get("image_id"))
     result_id = data.get("result_id")
+    target = cache.get_entry(result_id)
+    if target is None or target.get("kind", KIND_RESULT) != KIND_RESULT:
+        return jsonify({"error": "请选择有效的处理结果（差异热力图不能作为处理结果）"}), 400
     img_b = cache.result_image(result_id)
     if not rec or img_b is None:
         return jsonify({"error": "图像或结果不存在"}), 404
@@ -470,10 +474,13 @@ def compare_diff():
     psnr = 100.0 if mse < 1e-9 else 20 * math.log10(255.0 / max(rmse, 1e-6))
     changed = sum(c for i, c in enumerate(hist) if i > 8) / max(total, 1)
 
-    # 热力图：差异放大 + 伪彩色
+    # 热力图：差异放大 + 伪彩色。
+    # 标记为 KIND_DIFF：它只是本次对比的可视化副产物，仍可按返回的 file_url 展示，
+    # 但不会出现在 /api/results 处理结果列表里，也无法再被「选择处理结果」选中。
     heat = diff.point(lambda v: util.clamp(v * 4))
     heat_rgb = colorize_heat(heat)
-    result_id = cache.put(make_key(rec["hash"], result_id, "diff"), heat_rgb)
+    result_id = cache.put(make_key(rec["hash"], result_id, "diff"), heat_rgb,
+                          kind=KIND_DIFF)
     return jsonify({
         "result_id": result_id,
         "file_url": f"/api/results/{result_id}/file",

@@ -30,6 +30,13 @@ def make_key(*parts):
     return h.hexdigest()
 
 
+# 缓存条目类型：
+#   KIND_RESULT - 流水线/单图算法真正跑出来的「处理结果」，可在对比页被选择；
+#   KIND_DIFF   - 对比页生成的「差异热力图」，只是可视化副产物，不能当作处理结果。
+KIND_RESULT = "result"
+KIND_DIFF = "diff"
+
+
 class ResultCache:
     def __init__(self):
         self.store = JsonStore(config.CACHE_JSON, {})
@@ -78,14 +85,20 @@ class ResultCache:
             return None
 
     def list_results(self):
-        """按创建时间倒序返回结果条目列表。"""
-        entries = list(self.store.read().values())
+        """按创建时间倒序返回「处理结果」条目列表（差异热力图等副产物不在其中）。"""
+        entries = [e for e in self.store.read().values()
+                   if e.get("kind", KIND_RESULT) == KIND_RESULT]
         entries.sort(key=lambda e: e.get("created_at", ""), reverse=True)
         return entries
 
     # ------------------------------------------------------------------ 写
-    def put(self, key, image, meta=None):
-        """保存结果图并登记缓存，返回 result_id。"""
+    def put(self, key, image, meta=None, kind=KIND_RESULT):
+        """保存结果图并登记缓存，返回 result_id。
+
+        kind 见模块常量 KIND_RESULT / KIND_DIFF：差异热力图等可视化副产物
+        用 KIND_DIFF，它们仍可通过 result_id 取到文件（对比页要展示），但不会
+        出现在处理结果列表里，也无法被当作处理结果再次选择。
+        """
         result_id = uuid.uuid4().hex
         file_name = result_id + ".png"
         dest = os.path.join(config.RESULTS_DIR, file_name)
@@ -100,6 +113,7 @@ class ResultCache:
             "result_id": result_id,
             "key": key,
             "file": file_name,
+            "kind": kind,
             "size_bytes": os.path.getsize(dest),
             "width": rgb.size[0],
             "height": rgb.size[1],
@@ -127,8 +141,14 @@ class ResultCache:
         if count <= config.CACHE_MAX_ENTRIES and total_bytes <= config.CACHE_MAX_BYTES:
             return 0
 
-        # 按最后访问时间升序，优先淘汰最久未用
-        order = sorted(entries.items(), key=lambda kv: kv[1].get("last_access", 0))
+        # 淘汰顺序：先踢临时副产物（差异热力图），再按最后访问时间踢最久未用的，
+        # 避免反复生成对比图把真正的处理结果挤出缓存。
+        def _rank(kv):
+            key, entry = kv
+            return (0 if entry.get("kind", KIND_RESULT) == KIND_DIFF else 1,
+                    entry.get("last_access", 0))
+
+        order = sorted(entries.items(), key=_rank)
         removed = 0
         while order and (len(entries) > config.CACHE_MAX_ENTRIES
                          or total_bytes > config.CACHE_MAX_BYTES):
