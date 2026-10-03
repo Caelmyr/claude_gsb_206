@@ -84,8 +84,12 @@ class ResultCache:
         return entries
 
     # ------------------------------------------------------------------ 写
-    def put(self, key, image, meta=None):
-        """保存结果图并登记缓存，返回 result_id。"""
+    def put(self, key, image, meta=None, kind="result"):
+        """保存结果图并登记缓存，返回 result_id。
+
+        kind 标记条目用途：默认 "result" 为可继续使用的处理结果；
+        差异热力图等派生产物使用其它值，不会出现在 /api/results 列表中。
+        """
         result_id = uuid.uuid4().hex
         file_name = result_id + ".png"
         dest = os.path.join(config.RESULTS_DIR, file_name)
@@ -98,6 +102,7 @@ class ResultCache:
 
         entry = {
             "result_id": result_id,
+            "kind": kind,
             "key": key,
             "file": file_name,
             "size_bytes": os.path.getsize(dest),
@@ -144,6 +149,31 @@ class ResultCache:
             removed += 1
         self.store.write(entries)
         return removed
+
+    def mark_kind(self, keys, kind):
+        """给指定缓存键的条目补写 kind（用于旧差异热力图的一次性回溯标记）。"""
+        keys = set(keys)
+        if not keys:
+            return 0
+
+        def _upd(doc):
+            doc = dict(doc)
+            marked = 0
+            for k in list(keys):
+                e = doc.get(k)
+                if e and e.get("kind", "result") != kind:
+                    e = dict(e)
+                    e["kind"] = kind
+                    doc[k] = e
+                    marked += 1
+            return doc
+
+        # JsonStore.update 无法回传计数，先在内存中统计再落盘
+        doc = self.store.read()
+        marked = sum(1 for k in keys if k in doc and doc[k].get("kind", "result") != kind)
+        if marked:
+            self.store.update(_upd)
+        return marked
 
     def delete_result(self, result_id):
         """按 result_id 删除结果（供历史删除联动）。"""

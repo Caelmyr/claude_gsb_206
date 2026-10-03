@@ -31,6 +31,10 @@ presets_store = JsonStore(config.PRESETS_JSON, [])
 
 bp = Blueprint("api", __name__, url_prefix="/api")
 
+# 差异热力图属于对比分析的派生产物，不是可供继续对比/处理的“处理结果”，
+# 缓存条目以该 kind 标记，/api/results 列表会将其排除。
+DIFF_HEATMAP_KIND = "diff_heatmap"
+
 
 # ---------------------------------------------------------------------------
 # 工具
@@ -82,6 +86,7 @@ def _run_op(image_id, op_name, params, func):
 def _result_view(entry):
     return {
         "result_id": entry.get("result_id"),
+        "kind": entry.get("kind", "result"),
         "key": entry.get("key"),
         "width": entry.get("width"),
         "height": entry.get("height"),
@@ -353,7 +358,9 @@ def run_pipeline():
 
 @bp.get("/results")
 def list_results():
-    return jsonify({"results": [_result_view(e) for e in cache.list_results()]})
+    # 只列真正的处理结果；差异热力图等派生产物不能混入选择列表。
+    entries = [e for e in cache.list_results() if e.get("kind", "result") == "result"]
+    return jsonify({"results": [_result_view(e) for e in entries]})
 
 
 @bp.get("/results/<result_id>")
@@ -454,8 +461,8 @@ def run_style():
 def compare_diff():
     data = request.get_json(silent=True) or {}
     rec, img_a = _load_full_image(data.get("image_id"))
-    result_id = data.get("result_id")
-    img_b = cache.result_image(result_id)
+    source_result_id = data.get("result_id")
+    img_b = cache.result_image(source_result_id)
     if not rec or img_b is None:
         return jsonify({"error": "图像或结果不存在"}), 404
 
@@ -470,13 +477,19 @@ def compare_diff():
     psnr = 100.0 if mse < 1e-9 else 20 * math.log10(255.0 / max(rmse, 1e-6))
     changed = sum(c for i, c in enumerate(hist) if i > 8) / max(total, 1)
 
-    # 热力图：差异放大 + 伪彩色
+    # 热力图：差异放大 + 伪彩色。标记为差异派生产物，不进入 /api/results 列表。
     heat = diff.point(lambda v: util.clamp(v * 4))
     heat_rgb = colorize_heat(heat)
-    result_id = cache.put(make_key(rec["hash"], result_id, "diff"), heat_rgb)
+    diff_id = cache.put(
+        make_key(rec["hash"], source_result_id, "diff"),
+        heat_rgb,
+        {"image_id": rec["id"], "source_result_id": source_result_id},
+        kind=DIFF_HEATMAP_KIND,
+    )
     return jsonify({
-        "result_id": result_id,
-        "file_url": f"/api/results/{result_id}/file",
+        "result_id": diff_id,
+        "kind": DIFF_HEATMAP_KIND,
+        "file_url": f"/api/results/{diff_id}/file",
         "metrics": {"mse": round(mse, 2), "rmse": round(rmse, 2),
                     "psnr": round(psnr, 2), "changed_ratio": round(changed, 4)},
     })
@@ -645,7 +658,27 @@ def restore_history(history_id):
 def init_app(app):
     """在应用启动时注册蓝图并做一次性一致性检查。"""
     app.register_blueprint(bp)
+    _mark_legacy_diff_results(app)
     issues = image_store.reconcile()
     if issues["orphan_files"] or issues["orphan_meta"]:
         app.logger.info("启动一致性检查发现孤儿：%s", issues)
     return app
+
+
+def _mark_legacy_diff_results(app=None):
+    """把升级前混入缓存、没有 kind 标记的旧差异热力图补标为派生产物。
+
+    旧版 /api/compare/diff 使用确定性键 make_key(图像哈希, 被对比结果id, "diff")，
+    这里枚举原图哈希与处理结果 id 精确还原这些键；误匹配（其它调用方碰巧生成
+    同键条目）概率极低，且仅影响其在结果列表中的可见性。
+    """
+    entries = cache.list_results()
+    source_ids = {e.get("result_id") for e in entries if e.get("kind", "result") == "result"}
+    source_ids.update(h.get("result_id") for h in history.list() if h.get("result_id"))
+    source_ids.discard(None)
+    hashes = {r.get("hash") for r in image_store.list_records()}
+    hashes.discard(None)
+    diff_keys = [make_key(h, rid, "diff") for h in hashes for rid in source_ids]
+    marked = cache.mark_kind(diff_keys, DIFF_HEATMAP_KIND)
+    if marked and app is not None:
+        app.logger.info("已将 %d 张历史差异热力图标记为派生产物", marked)
